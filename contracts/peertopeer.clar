@@ -85,6 +85,8 @@
 (define-public (create-pool (name (string-ascii 50)) (description (string-ascii 200)) (coverage-amount uint))
   (let
     ((new-pool-id (var-get pool-id)))
+    (asserts! (not (var-get pool-paused)) (err u20))
+
     (asserts! (>= coverage-amount (var-get min-contribution)) (err u1))
     (map-set pools
       { id: new-pool-id }
@@ -112,7 +114,8 @@
   (let
     ((pool (unwrap! (get-pool pool-idd) (err u2)))
      (member-data (get-pool-member pool-idd tx-sender)))
-    
+    (asserts! (not (var-get pool-paused)) (err u20))
+
     (asserts! (get active pool) (err u3))
     (asserts! (>= amount (var-get min-contribution)) (err u4))
     
@@ -187,7 +190,8 @@
     ((pool (unwrap! (get-pool pool-i) (err u2)))
      (member-data (unwrap! (get-pool-member pool-i tx-sender) (err u6)))
      (claim-counter (unwrap! (map-get? pool-claim-counter { pool-id: pool-i }) (err u8))))
-    
+    (asserts! (not (var-get pool-paused)) (err u20))
+
     (asserts! (get active pool) (err u3))
     (asserts! (get active member-data) (err u7))
     (asserts! (<= amount (get coverage-amount pool)) (err u9))
@@ -259,7 +263,8 @@
   (let
     ((pool (unwrap! (get-pool pool-) (err u2)))
      (claim-data (unwrap! (get-claim pool- claim-id) (err u10))))
-    
+    (asserts! (not (var-get pool-paused)) (err u20))
+
     (asserts! (get active pool) (err u3))
     (asserts! (is-eq (get status claim-data) "pending") (err u11))
     (asserts! (>= (- stacks-block-height (get filed-block claim-data)) (var-get voting-period)) (err u14))
@@ -273,6 +278,18 @@
             paid: true
           })
         )
+
+              (let ((stats (unwrap! (get-pool-statistics pool-) (err u22))))
+        (map-set pool-statistics
+          { pool-id: pool- }
+          (merge stats {
+            total-claims-approved: (+ (get total-claims-approved stats) u1),
+            total-amount-paid: (+ (get total-amount-paid stats) (get amount claim-data)),
+            last-activity-block: stacks-block-height
+          })
+        )
+      )
+
         
         (let
           ((claimant-data (unwrap! (get-pool-member pool- (get claimant claim-data)) (err u15))))
@@ -369,4 +386,61 @@
     (var-set profit-sharing-percentage new-percentage)
     (ok true)
   )
+)
+
+
+
+(define-data-var pool-paused bool false)
+
+(define-read-only (is-pool-paused)
+  (var-get pool-paused)
+)
+
+(define-public (pause-pool)
+  (begin
+    (asserts! (is-eq tx-sender (var-get admin)) (err u19))
+    (var-set pool-paused true)
+    (ok true)
+  )
+)
+
+(define-public (unpause-pool)
+  (begin
+    (asserts! (is-eq tx-sender (var-get admin)) (err u19))
+    (var-set pool-paused false)
+    (ok true)
+  )
+)
+
+
+(define-map pool-statistics
+  { pool-id: uint }
+  {
+    total-claims-filed: uint,
+    total-claims-approved: uint,
+    total-amount-paid: uint,
+    average-processing-time: uint,
+    last-activity-block: uint
+  }
+)
+
+(define-public (initialize-pool-stats (pool-id-param uint))
+  (begin
+    (asserts! (is-some (get-pool pool-id-param)) (err u21))
+    (map-set pool-statistics
+      { pool-id: pool-id-param }
+      {
+        total-claims-filed: u0,
+        total-claims-approved: u0,
+        total-amount-paid: u0,
+        average-processing-time: u0,
+        last-activity-block: stacks-block-height
+      }
+    )
+    (ok true)
+  )
+)
+
+(define-read-only (get-pool-statistics (pool-id-param uint))
+  (map-get? pool-statistics { pool-id: pool-id-param })
 )
