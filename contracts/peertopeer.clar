@@ -444,3 +444,272 @@
 (define-read-only (get-pool-statistics (pool-id-param uint))
   (map-get? pool-statistics { pool-id: pool-id-param })
 )
+
+
+(define-data-var default-premium-period uint u4320)
+(define-data-var grace-period-blocks uint u1440)
+(define-data-var late-payment-penalty-percentage uint u10)
+
+(define-map pool-premium-config
+  { pool-id: uint }
+  {
+    premium-amount: uint,
+    premium-period-blocks: uint,
+    auto-collection-enabled: bool,
+    penalty-rate: uint
+  }
+)
+
+(define-map member-premium-status
+  { pool-id: uint, member: principal }
+  {
+    last-payment-block: uint,
+    next-due-block: uint,
+    payments-made: uint,
+    total-penalties: uint,
+    coverage-active: bool,
+    grace-period-end: uint
+  }
+)
+
+(define-map premium-payments
+  { pool-id: uint, member: principal, payment-id: uint }
+  {
+    amount: uint,
+    payment-block: uint,
+    period-covered: uint,
+    penalty-amount: uint
+  }
+)
+
+(define-map member-payment-counter
+  { pool-id: uint, member: principal }
+  { counter: uint }
+)
+
+(define-read-only (get-pool-premium-config (pid uint))
+  (map-get? pool-premium-config { pool-id: pid })
+)
+
+(define-read-only (get-member-premium-status (pid uint) (member principal))
+  (map-get? member-premium-status { pool-id: pid, member: member })
+)
+
+(define-read-only (get-premium-payment (pid uint) (member principal) (payment-id uint))
+  (map-get? premium-payments { pool-id: pid, member: member, payment-id: payment-id })
+)
+
+(define-read-only (is-coverage-active (pid uint) (member principal))
+  (match (get-member-premium-status pid member)
+    premium-status (get coverage-active premium-status)
+    false
+  )
+)
+
+(define-read-only (calculate-premium-due (pid uint) (member principal))
+  (match (get-pool-premium-config pid)
+    config
+    (match (get-member-premium-status pid member)
+      status
+      (let
+        ((blocks-overdue (if (> stacks-block-height (get next-due-block status))
+                           (- stacks-block-height (get next-due-block status))
+                           u0))
+         (base-premium (get premium-amount config))
+         (penalty (if (> blocks-overdue u0)
+                    (/ (* base-premium (get penalty-rate config)) u100)
+                    u0)))
+        (ok (+ base-premium penalty))
+      )
+      (ok (get premium-amount config))
+    )
+    (err u30)
+  )
+)
+
+(define-public (setup-pool-premiums (pid uint) (premium-amount uint) (premium-period-blocks uint))
+  (let
+    ((pool (unwrap! (get-pool pid) (err u2))))
+    
+    (asserts! (is-eq tx-sender (get creator pool)) (err u16))
+    (asserts! (> premium-amount u0) (err u31))
+    (asserts! (> premium-period-blocks u0) (err u32))
+    
+    (map-set pool-premium-config
+      { pool-id: pid }
+      {
+        premium-amount: premium-amount,
+        premium-period-blocks: premium-period-blocks,
+        auto-collection-enabled: true,
+        penalty-rate: (var-get late-payment-penalty-percentage)
+      }
+    )
+    
+    (ok true)
+  )
+)
+
+(define-public (initialize-member-premiums (pid uint) (member principal))
+  (let
+    ((pool (unwrap! (get-pool pid) (err u2)))
+     (config (unwrap! (get-pool-premium-config pid) (err u33)))
+     (member-data (unwrap! (get-pool-member pid member) (err u6))))
+    
+    (asserts! (get active member-data) (err u7))
+    
+    (map-set member-premium-status
+      { pool-id: pid, member: member }
+      {
+        last-payment-block: (get joined-block member-data),
+        next-due-block: (+ (get joined-block member-data) (get premium-period-blocks config)),
+        payments-made: u0,
+        total-penalties: u0,
+        coverage-active: true,
+        grace-period-end: u0
+      }
+    )
+    
+    (map-set member-payment-counter
+      { pool-id: pid, member: member }
+      { counter: u0 }
+    )
+    
+    (ok true)
+  )
+)
+
+(define-public (pay-premium (pid uint))
+  (let
+    ((pool (unwrap! (get-pool pid) (err u2)))
+     (config (unwrap! (get-pool-premium-config pid) (err u33)))
+     (premium-status (unwrap! (get-member-premium-status pid tx-sender) (err u34)))
+     (payment-counter (unwrap! (map-get? member-payment-counter { pool-id: pid, member: tx-sender }) (err u35)))
+     (premium-due (unwrap! (calculate-premium-due pid tx-sender) (err u36))))
+    
+    (asserts! (not (var-get pool-paused)) (err u20))
+    (asserts! (get active pool) (err u3))
+    
+    (let
+      ((current-payment-id (get counter payment-counter))
+       (blocks-overdue (if (> stacks-block-height (get next-due-block premium-status))
+                         (- stacks-block-height (get next-due-block premium-status))
+                         u0))
+       (penalty-amount (if (> blocks-overdue u0)
+                         (/ (* (get premium-amount config) (get penalty-rate config)) u100)
+                         u0))
+       (new-next-due (+ stacks-block-height (get premium-period-blocks config))))
+      
+      (map-set premium-payments
+        { pool-id: pid, member: tx-sender, payment-id: current-payment-id }
+        {
+          amount: premium-due,
+          payment-block: stacks-block-height,
+          period-covered: (get premium-period-blocks config),
+          penalty-amount: penalty-amount
+        }
+      )
+      
+      (map-set member-premium-status
+        { pool-id: pid, member: tx-sender }
+        (merge premium-status {
+          last-payment-block: stacks-block-height,
+          next-due-block: new-next-due,
+          payments-made: (+ (get payments-made premium-status) u1),
+          total-penalties: (+ (get total-penalties premium-status) penalty-amount),
+          coverage-active: true,
+          grace-period-end: u0
+        })
+      )
+      
+      (map-set member-payment-counter
+        { pool-id: pid, member: tx-sender }
+        { counter: (+ current-payment-id u1) }
+      )
+      
+      (map-set pools
+        { id: pid }
+        (merge pool {
+          total-funds: (+ (get total-funds pool) premium-due)
+        })
+      )
+      
+      (stx-transfer? premium-due tx-sender (as-contract tx-sender))
+    )
+  )
+)
+
+(define-public (suspend-coverage-for-non-payment (pid uint) (member principal))
+  (let
+    ((config (unwrap! (get-pool-premium-config pid) (err u33)))
+     (premium-status (unwrap! (get-member-premium-status pid member) (err u34))))
+    
+    (asserts! (> stacks-block-height (get next-due-block premium-status)) (err u37))
+    (asserts! (get coverage-active premium-status) (err u38))
+    
+    (let
+      ((grace-end (+ (get next-due-block premium-status) (var-get grace-period-blocks))))
+      
+      (if (> stacks-block-height grace-end)
+        (map-set member-premium-status
+          { pool-id: pid, member: member }
+          (merge premium-status {
+            coverage-active: false,
+            grace-period-end: u0
+          })
+        )
+        (map-set member-premium-status
+          { pool-id: pid, member: member }
+          (merge premium-status {
+            grace-period-end: grace-end
+          })
+        )
+      )
+    )
+    
+    (ok true)
+  )
+)
+
+(define-public (bulk-suspend-overdue-members (pid uint) (members (list 50 principal)))
+  (let
+    ((pool (unwrap! (get-pool pid) (err u2))))
+    
+    (asserts! (is-eq tx-sender (get creator pool)) (err u16))
+    
+    (ok (map suspend-coverage-for-non-payment-helper 
+         (map create-pool-member-tuple members)))
+  )
+)
+
+(define-private (create-pool-member-tuple (member principal))
+  { pid: u0, member: member }
+)
+
+(define-private (suspend-coverage-for-non-payment-helper (data { pid: uint, member: principal }))
+  (suspend-coverage-for-non-payment (get pid data) (get member data))
+)
+
+(define-read-only (get-overdue-members (pid uint))
+  (ok pid)
+)
+
+(define-public (update-premium-config (pid uint) (new-premium-amount uint) (new-penalty-rate uint))
+  (let
+    ((pool (unwrap! (get-pool pid) (err u2)))
+     (config (unwrap! (get-pool-premium-config pid) (err u33))))
+    
+    (asserts! (is-eq tx-sender (get creator pool)) (err u16))
+    (asserts! (> new-premium-amount u0) (err u31))
+    (asserts! (<= new-penalty-rate u50) (err u39))
+    
+    (map-set pool-premium-config
+      { pool-id: pid }
+      (merge config {
+        premium-amount: new-premium-amount,
+        penalty-rate: new-penalty-rate
+      })
+    )
+    
+    (ok true)
+  )
+)
