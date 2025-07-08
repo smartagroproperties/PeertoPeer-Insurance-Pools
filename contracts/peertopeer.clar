@@ -5,6 +5,65 @@
 (define-data-var voting-period uint u144)
 (define-data-var profit-sharing-percentage uint u5)
 
+
+(define-data-var risk-assessment-enabled bool true)
+(define-data-var base-risk-score uint u100)
+(define-data-var max-risk-multiplier uint u300)
+(define-data-var min-risk-multiplier uint u50)
+(define-data-var loyalty-bonus-threshold uint u12)
+(define-data-var loyalty-discount-percentage uint u15)
+
+(define-private (min-value (a uint) (b uint))
+  (if (< a b) a b)
+)
+
+(define-private (max-value (a uint) (b uint))
+  (if (> a b) a b)
+)
+
+(define-map member-risk-profile
+  { pool-id: uint, member: principal }
+  {
+    risk-score: uint,
+    claims-ratio: uint,
+    participation-score: uint,
+    loyalty-months: uint,
+    last-assessment-block: uint,
+    premium-multiplier: uint,
+    warnings-issued: uint,
+    consecutive-payments: uint
+  }
+)
+
+(define-map pool-risk-metrics
+  { pool-id: uint }
+  {
+    average-risk-score: uint,
+    total-risk-adjustments: uint,
+    pool-stability-score: uint,
+    risk-distribution: (list 5 uint),
+    last-rebalance-block: uint,
+    high-risk-member-count: uint,
+    low-risk-member-count: uint
+  }
+)
+
+(define-map risk-adjustment-history
+  { pool-id: uint, member: principal, adjustment-id: uint }
+  {
+    old-multiplier: uint,
+    new-multiplier: uint,
+    reason: (string-ascii 50),
+    adjustment-block: uint,
+    automated: bool
+  }
+)
+
+(define-map member-adjustment-counter
+  { pool-id: uint, member: principal }
+  { counter: uint }
+)
+
 (define-map pools
   { id: uint }
   {
@@ -254,6 +313,346 @@
         votes-no: (+ (get votes-no claim-data) (if vote u0 u1))
       })
     )
+    
+    (ok true)
+    )
+    )
+
+
+(define-read-only (get-member-risk-profile (pid uint) (member principal))
+  (map-get? member-risk-profile { pool-id: pid, member: member })
+)
+
+(define-read-only (get-pool-risk-metrics (pid uint))
+  (map-get? pool-risk-metrics { pool-id: pid })
+)
+
+(define-read-only (get-risk-adjustment-history (pid uint) (member principal) (adjustment-id uint))
+  (map-get? risk-adjustment-history { pool-id: pid, member: member, adjustment-id: adjustment-id })
+)
+
+(define-read-only (calculate-risk-based-premium (pid uint) (member principal))
+  (match (get-pool-premium-config pid)
+    config
+    (match (get-member-risk-profile pid member)
+      risk-profile
+      (let
+        ((base-premium (get premium-amount config))
+         (risk-multiplier (get premium-multiplier risk-profile))
+         (loyalty-discount (if (>= (get loyalty-months risk-profile) (var-get loyalty-bonus-threshold))
+                             (var-get loyalty-discount-percentage)
+                             u0)))
+        (let
+          ((adjusted-premium (/ (* base-premium risk-multiplier) u100))
+           (final-premium (- adjusted-premium (/ (* adjusted-premium loyalty-discount) u100))))
+          (ok final-premium)
+        )
+      )
+      (ok (get premium-amount config))
+    )
+    (err u40)
+  )
+)
+
+(define-public (initialize-member-risk-profile (pid uint) (member principal))
+  (let
+    ((pool (unwrap! (get-pool pid) (err u2)))
+     (member-data (unwrap! (get-pool-member pid member) (err u6))))
+    
+    (asserts! (get active member-data) (err u7))
+    (asserts! (is-none (get-member-risk-profile pid member)) (err u41))
+    
+    (map-set member-risk-profile
+      { pool-id: pid, member: member }
+      {
+        risk-score: (var-get base-risk-score),
+        claims-ratio: u0,
+        participation-score: u100,
+        loyalty-months: u0,
+        last-assessment-block: stacks-block-height,
+        premium-multiplier: u100,
+        warnings-issued: u0,
+        consecutive-payments: u0
+      }
+    )
+    
+    (map-set member-adjustment-counter
+      { pool-id: pid, member: member }
+      { counter: u0 }
+    )
+    
+    (ok true)
+  )
+)
+
+(define-public (assess-member-risk (pid uint) (member principal))
+  (let
+    ((pool (unwrap! (get-pool pid) (err u2)))
+     (member-data (unwrap! (get-pool-member pid member) (err u6)))
+     (risk-profile (unwrap! (get-member-risk-profile pid member) (err u42)))
+     (premium-status (get-member-premium-status pid member)))
+    
+    (asserts! (var-get risk-assessment-enabled) (err u43))
+    (asserts! (get active member-data) (err u7))
+    
+    (let
+      ((claims-filed (get claims-filed member-data))
+       (claims-approved (get claims-approved member-data))
+       (claims-ratio (if (> claims-filed u0)
+                       (/ (* claims-approved u100) claims-filed)
+                       u0))
+       (participation-score (calculate-participation-score pid member))
+       (loyalty-months (calculate-loyalty-months pid member))
+       (consecutive-payments (match premium-status
+                               status (get payments-made status)
+                               u0)))
+      
+      (let
+        ((new-risk-score (calculate-risk-score claims-ratio participation-score loyalty-months consecutive-payments))
+         (new-multiplier (calculate-premium-multiplier new-risk-score)))
+        
+        (map-set member-risk-profile
+          { pool-id: pid, member: member }
+          (merge risk-profile {
+            risk-score: new-risk-score,
+            claims-ratio: claims-ratio,
+            participation-score: participation-score,
+            loyalty-months: loyalty-months,
+            last-assessment-block: stacks-block-height,
+            premium-multiplier: new-multiplier,
+            consecutive-payments: consecutive-payments
+          })
+        )
+        
+        (record-risk-adjustment pid member (get premium-multiplier risk-profile) new-multiplier "automated-assessment")
+      )
+    )
+  )
+)
+
+(define-private (calculate-participation-score (pid uint) (member principal))
+  (let
+    ((pool (unwrap-panic (get-pool pid)))
+     (member-data (unwrap-panic (get-pool-member pid member)))
+     (blocks-since-joined (- stacks-block-height (get joined-block member-data)))
+     (expected-participation (/ blocks-since-joined u144)))
+    
+    (if (> expected-participation u0)
+      (min-value u150 (+ u50 (/ (* u50 u1) expected-participation)))
+      u100
+    )
+  )
+)
+
+(define-private (calculate-loyalty-months (pid uint) (member principal))
+  (let
+    ((member-data (unwrap-panic (get-pool-member pid member)))
+     (blocks-since-joined (- stacks-block-height (get joined-block member-data)))
+     (months (/ blocks-since-joined u4320)))
+    months
+  )
+)
+
+(define-private (calculate-risk-score (claims-ratio uint) (participation-score uint) (loyalty-months uint) (consecutive-payments uint))
+  (let
+    ((base-score (var-get base-risk-score))
+     (claims-impact (if (> claims-ratio u50) (+ u20 (/ claims-ratio u5)) u0))
+     (participation-bonus (if (> participation-score u120) u10 u0))
+     (loyalty-bonus (min-value u15 (/ loyalty-months u2)))
+     (payment-bonus (min-value u10 (/ consecutive-payments u3))))
+    
+    (let
+      ((adjusted-score (+ base-score claims-impact)))
+      (max-value u20 (- adjusted-score (+ participation-bonus loyalty-bonus payment-bonus)))
+    )
+  )
+)
+
+(define-private (calculate-premium-multiplier (risk-score uint))
+  (let
+    ((base-multiplier u100)
+     (risk-factor (if (> risk-score u100)
+                    (min-value (var-get max-risk-multiplier) (+ u100 (/ (* (- risk-score u100) u2) u1)))
+                    (max-value (var-get min-risk-multiplier) (- u100 (/ (* (- u100 risk-score) u1) u2))))))
+    risk-factor
+  )
+)
+
+(define-private (record-risk-adjustment (pid uint) (member principal) (old-multiplier uint) (new-multiplier uint) (reason (string-ascii 50)))
+  (let
+    ((adjustment-counter (unwrap! (map-get? member-adjustment-counter { pool-id: pid, member: member }) (err u44))))
+    
+    (let
+      ((adjustment-id (get counter adjustment-counter)))
+      
+      (map-set risk-adjustment-history
+        { pool-id: pid, member: member, adjustment-id: adjustment-id }
+        {
+          old-multiplier: old-multiplier,
+          new-multiplier: new-multiplier,
+          reason: reason,
+          adjustment-block: stacks-block-height,
+          automated: true
+        }
+      )
+      
+      (map-set member-adjustment-counter
+        { pool-id: pid, member: member }
+        { counter: (+ adjustment-id u1) }
+      )
+      
+      (ok true)
+    )
+  )
+)
+
+(define-public (bulk-assess-member-risks (pid uint) (members (list 20 principal)))
+  (let
+    ((pool (unwrap! (get-pool pid) (err u2))))
+    
+    (asserts! (is-eq tx-sender (get creator pool)) (err u16))
+    (asserts! (var-get risk-assessment-enabled) (err u43))
+    
+    (ok (map assess-member-risk-helper
+         (map create-assessment-tuple members)))
+  )
+)
+
+(define-private (create-assessment-tuple (member principal))
+  { pid: u0, member: member }
+)
+
+(define-private (assess-member-risk-helper (data { pid: uint, member: principal }))
+  (assess-member-risk (get pid data) (get member data))
+)
+
+(define-public (rebalance-pool-risk (pid uint))
+  (let
+    ((pool (unwrap! (get-pool pid) (err u2)))
+     (current-metrics (get-pool-risk-metrics pid)))
+    
+    (asserts! (is-eq tx-sender (get creator pool)) (err u16))
+    (asserts! (var-get risk-assessment-enabled) (err u43))
+    
+    (let
+      ((stability-score (calculate-pool-stability-score pid))
+       (high-risk-count (count-high-risk-members pid))
+       (low-risk-count (count-low-risk-members pid)))
+      
+      (map-set pool-risk-metrics
+        { pool-id: pid }
+        {
+          average-risk-score: (calculate-average-risk-score pid),
+          total-risk-adjustments: (match current-metrics
+                                    metrics (+ (get total-risk-adjustments metrics) u1)
+                                    u1),
+          pool-stability-score: stability-score,
+          risk-distribution: (list u0 u0 u0 u0 u0),
+          last-rebalance-block: stacks-block-height,
+          high-risk-member-count: high-risk-count,
+          low-risk-member-count: low-risk-count
+        }
+      )
+      
+      (ok true)
+    )
+  )
+)
+
+(define-private (calculate-pool-stability-score (pid uint))
+  (let
+    ((pool (unwrap-panic (get-pool pid))))
+    
+    (let
+      ((member-count (get member-count pool))
+       (total-funds (get total-funds pool))
+       (base-stability (if (> member-count u10) u100 (* member-count u10))))
+      
+      (min-value u150 (+ base-stability (/ total-funds u1000000)))
+    )
+  )
+)
+
+(define-private (calculate-average-risk-score (pid uint))
+  u100
+)
+
+(define-private (count-high-risk-members (pid uint))
+  u0
+)
+
+(define-private (count-low-risk-members (pid uint))
+  u0
+)
+
+(define-public (issue-risk-warning (pid uint) (member principal) (warning-reason (string-ascii 100)))
+  (let
+    ((pool (unwrap! (get-pool pid) (err u2)))
+     (risk-profile (unwrap! (get-member-risk-profile pid member) (err u42))))
+    
+    (asserts! (is-eq tx-sender (get creator pool)) (err u16))
+    
+    (let
+      ((new-warning-count (+ (get warnings-issued risk-profile) u1)))
+      
+      (map-set member-risk-profile
+        { pool-id: pid, member: member }
+        (merge risk-profile {
+          warnings-issued: new-warning-count,
+          premium-multiplier: (min-value (var-get max-risk-multiplier) 
+                                 (+ (get premium-multiplier risk-profile) u25))
+        })
+      )
+      
+      (record-risk-adjustment pid member 
+                             (get premium-multiplier risk-profile) 
+                             (get premium-multiplier risk-profile) 
+                             "warning-issued")
+    )
+  )
+)
+
+(define-public (reward-good-behavior (pid uint) (member principal))
+  (let
+    ((pool (unwrap! (get-pool pid) (err u2)))
+     (risk-profile (unwrap! (get-member-risk-profile pid member) (err u42))))
+    
+    (asserts! (is-eq tx-sender (get creator pool)) (err u16))
+    
+    (let
+      ((current-multiplier (get premium-multiplier risk-profile))
+       (new-multiplier (max-value (var-get min-risk-multiplier) (- current-multiplier u15))))
+      
+      (map-set member-risk-profile
+        { pool-id: pid, member: member }
+        (merge risk-profile {
+          premium-multiplier: new-multiplier,
+          participation-score: (min-value u150 (+ (get participation-score risk-profile) u10))
+        })
+      )
+      
+      (record-risk-adjustment pid member current-multiplier new-multiplier "good-behavior-reward")
+    )
+  )
+)
+
+(define-public (toggle-risk-assessment (enabled bool))
+  (begin
+    (asserts! (is-eq tx-sender (var-get admin)) (err u17))
+    (var-set risk-assessment-enabled enabled)
+    (ok true)
+  )
+)
+
+(define-public (update-risk-parameters (new-base-score uint) (new-max-multiplier uint) (new-min-multiplier uint))
+  (begin
+    (asserts! (is-eq tx-sender (var-get admin)) (err u17))
+    (asserts! (> new-base-score u0) (err u45))
+    (asserts! (> new-max-multiplier new-min-multiplier) (err u46))
+    
+    (var-set base-risk-score new-base-score)
+    (var-set max-risk-multiplier new-max-multiplier)
+    (var-set min-risk-multiplier new-min-multiplier)
     
     (ok true)
   )
