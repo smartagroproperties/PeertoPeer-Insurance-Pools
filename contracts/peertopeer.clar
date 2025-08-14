@@ -318,6 +318,394 @@
     )
     )
 
+;; Dispute Resolution System - Unique peer-to-peer insurance conflict management
+(define-data-var dispute-counter uint u0)
+(define-data-var arbitration-period uint u288) ;; 2 days in blocks
+(define-data-var min-arbitrator-stake uint u500000)
+(define-data-var arbitrator-reward-percentage uint u3)
+(define-data-var dispute-fee uint u100000)
+
+(define-map disputes
+  { dispute-id: uint }
+  {
+    pool-id: uint,
+    initiator: principal,
+    respondent: principal,
+    dispute-type: (string-ascii 30),
+    description: (string-ascii 300),
+    amount-disputed: uint,
+    filed-block: uint,
+    status: (string-ascii 20),
+    arbitrator: (optional principal),
+    arbitrator-deadline: uint,
+    evidence-count: uint,
+    community-votes-for: uint,
+    community-votes-against: uint,
+    resolution: (string-ascii 200),
+    appeal-count: uint
+  }
+)
+
+(define-map dispute-evidence
+  { dispute-id: uint, evidence-id: uint }
+  {
+    submitter: principal,
+    evidence-type: (string-ascii 20),
+    description: (string-ascii 250),
+    submission-block: uint,
+    verified: bool
+  }
+)
+
+(define-map arbitrators
+  { pool-id: uint, arbitrator: principal }
+  {
+    stake-amount: uint,
+    cases-handled: uint,
+    success-rate: uint,
+    registration-block: uint,
+    active: bool,
+    disputes-assigned: uint
+  }
+)
+
+(define-map dispute-votes
+  { dispute-id: uint, voter: principal }
+  {
+    vote: bool,
+    voting-power: uint,
+    vote-block: uint
+  }
+)
+
+(define-map evidence-counter
+  { dispute-id: uint }
+  { counter: uint }
+)
+
+;; Read-only functions for dispute system
+(define-read-only (get-dispute (dispute-id uint))
+  (map-get? disputes { dispute-id: dispute-id })
+)
+
+(define-read-only (get-arbitrator-info (pool-identifier uint) (arbitrator principal))
+  (map-get? arbitrators { pool-id: pool-identifier, arbitrator: arbitrator })
+)
+
+(define-read-only (get-dispute-evidence (dispute-id uint) (evidence-id uint))
+  (map-get? dispute-evidence { dispute-id: dispute-id, evidence-id: evidence-id })
+)
+
+(define-read-only (get-dispute-vote (dispute-id uint) (voter principal))
+  (map-get? dispute-votes { dispute-id: dispute-id, voter: voter })
+)
+
+;; Register as arbitrator - community members can mediate disputes
+(define-public (register-arbitrator (pool-identifier uint) (stake-amount uint))
+  (let
+    ((pool (unwrap! (get-pool pool-identifier) (err u50)))
+     (member-data (unwrap! (get-pool-member pool-identifier tx-sender) (err u51))))
+    
+    (asserts! (get active pool) (err u52))
+    (asserts! (get active member-data) (err u53))
+    (asserts! (>= stake-amount (var-get min-arbitrator-stake)) (err u54))
+    (asserts! (is-none (get-arbitrator-info pool-identifier tx-sender)) (err u55))
+    
+    ;; Transfer stake amount to contract
+    (try! (stx-transfer? stake-amount tx-sender (as-contract tx-sender)))
+    
+    (map-set arbitrators
+      { pool-id: pool-identifier, arbitrator: tx-sender }
+      {
+        stake-amount: stake-amount,
+        cases-handled: u0,
+        success-rate: u100,
+        registration-block: stacks-block-height,
+        active: true,
+        disputes-assigned: u0
+      }
+    )
+    
+    (ok true)
+  )
+)
+
+;; File a dispute - members can challenge decisions or conflicts
+(define-public (file-dispute 
+    (pool-identifier uint) 
+    (respondent principal) 
+    (dispute-type (string-ascii 30)) 
+    (description (string-ascii 300)) 
+    (amount-disputed uint))
+  (let
+    ((pool (unwrap! (get-pool pool-identifier) (err u50)))
+     (member-data (unwrap! (get-pool-member pool-identifier tx-sender) (err u51)))
+     (new-dispute-id (var-get dispute-counter)))
+    
+    (asserts! (get active pool) (err u52))
+    (asserts! (get active member-data) (err u53))
+    (asserts! (not (is-eq tx-sender respondent)) (err u56))
+    
+    ;; Pay dispute filing fee
+    (try! (stx-transfer? (var-get dispute-fee) tx-sender (as-contract tx-sender)))
+    
+    (map-set disputes
+      { dispute-id: new-dispute-id }
+      {
+        pool-id: pool-identifier,
+        initiator: tx-sender,
+        respondent: respondent,
+        dispute-type: dispute-type,
+        description: description,
+        amount-disputed: amount-disputed,
+        filed-block: stacks-block-height,
+        status: "pending",
+        arbitrator: none,
+        arbitrator-deadline: u0,
+        evidence-count: u0,
+        community-votes-for: u0,
+        community-votes-against: u0,
+        resolution: "",
+        appeal-count: u0
+      }
+    )
+    
+    (map-set evidence-counter
+      { dispute-id: new-dispute-id }
+      { counter: u0 }
+    )
+    
+    (var-set dispute-counter (+ new-dispute-id u1))
+    (ok new-dispute-id)
+  )
+)
+
+;; Assign arbitrator to dispute - automated selection based on availability
+(define-public (assign-arbitrator (dispute-id uint) (arbitrator principal))
+  (let
+    ((dispute-data (unwrap! (get-dispute dispute-id) (err u57)))
+     (arbitrator-info (unwrap! (get-arbitrator-info (get pool-id dispute-data) arbitrator) (err u58))))
+    
+    (asserts! (is-eq (get status dispute-data) "pending") (err u59))
+    (asserts! (get active arbitrator-info) (err u60))
+    (asserts! (not (is-eq arbitrator (get initiator dispute-data))) (err u61))
+    (asserts! (not (is-eq arbitrator (get respondent dispute-data))) (err u61))
+    
+    (map-set disputes
+      { dispute-id: dispute-id }
+      (merge dispute-data {
+        arbitrator: (some arbitrator),
+        arbitrator-deadline: (+ stacks-block-height (var-get arbitration-period)),
+        status: "arbitration"
+      })
+    )
+    
+    (map-set arbitrators
+      { pool-id: (get pool-id dispute-data), arbitrator: arbitrator }
+      (merge arbitrator-info {
+        disputes-assigned: (+ (get disputes-assigned arbitrator-info) u1)
+      })
+    )
+    
+    (ok true)
+  )
+)
+
+;; Submit evidence for dispute - both parties can provide supporting materials
+(define-public (submit-evidence 
+    (dispute-id uint) 
+    (evidence-type (string-ascii 20)) 
+    (description (string-ascii 250)))
+  (let
+    ((dispute-data (unwrap! (get-dispute dispute-id) (err u57)))
+     (evidence-counter-data (unwrap! (map-get? evidence-counter { dispute-id: dispute-id }) (err u62))))
+    
+    (asserts! (is-eq (get status dispute-data) "arbitration") (err u63))
+    (asserts! (or (is-eq tx-sender (get initiator dispute-data))
+                  (is-eq tx-sender (get respondent dispute-data))) (err u64))
+    
+    (let
+      ((evidence-id (get counter evidence-counter-data)))
+      
+      (map-set dispute-evidence
+        { dispute-id: dispute-id, evidence-id: evidence-id }
+        {
+          submitter: tx-sender,
+          evidence-type: evidence-type,
+          description: description,
+          submission-block: stacks-block-height,
+          verified: false
+        }
+      )
+      
+      (map-set evidence-counter
+        { dispute-id: dispute-id }
+        { counter: (+ evidence-id u1) }
+      )
+      
+      (map-set disputes
+        { dispute-id: dispute-id }
+        (merge dispute-data {
+          evidence-count: (+ (get evidence-count dispute-data) u1)
+        })
+      )
+      
+      (ok evidence-id)
+    )
+  )
+)
+
+;; Arbitrator makes initial ruling on dispute
+(define-public (arbitrator-ruling (dispute-id uint) (resolution (string-ascii 200)) (favor-initiator bool))
+  (let
+    ((dispute-data (unwrap! (get-dispute dispute-id) (err u57))))
+    
+    (asserts! (is-eq (get status dispute-data) "arbitration") (err u63))
+    (asserts! (is-eq (some tx-sender) (get arbitrator dispute-data)) (err u65))
+    (asserts! (<= stacks-block-height (get arbitrator-deadline dispute-data)) (err u66))
+    
+    (map-set disputes
+      { dispute-id: dispute-id }
+      (merge dispute-data {
+        resolution: resolution,
+        status: "community-review"
+      })
+    )
+    
+    ;; Update arbitrator stats
+    (let
+      ((arbitrator-info (unwrap! (get-arbitrator-info (get pool-id dispute-data) tx-sender) (err u58))))
+      (map-set arbitrators
+        { pool-id: (get pool-id dispute-data), arbitrator: tx-sender }
+        (merge arbitrator-info {
+          cases-handled: (+ (get cases-handled arbitrator-info) u1)
+        })
+      )
+    )
+    
+    (ok true)
+  )
+)
+
+;; Community voting on arbitrator decisions - democratic oversight
+(define-public (vote-on-dispute (dispute-id uint) (support-ruling bool))
+  (let
+    ((dispute-data (unwrap! (get-dispute dispute-id) (err u57)))
+     (member-data (unwrap! (get-pool-member (get pool-id dispute-data) tx-sender) (err u51))))
+    
+    (asserts! (is-eq (get status dispute-data) "community-review") (err u67))
+    (asserts! (get active member-data) (err u53))
+    (asserts! (not (is-eq tx-sender (get initiator dispute-data))) (err u68))
+    (asserts! (not (is-eq tx-sender (get respondent dispute-data))) (err u68))
+    (asserts! (is-none (get-dispute-vote dispute-id tx-sender)) (err u69))
+    
+    ;; Calculate voting power based on contribution and membership duration
+    (let
+      ((voting-power (+ (/ (get contribution member-data) u100000)
+                       (/ (- stacks-block-height (get joined-block member-data)) u1440))))
+      
+      (map-set dispute-votes
+        { dispute-id: dispute-id, voter: tx-sender }
+        {
+          vote: support-ruling,
+          voting-power: voting-power,
+          vote-block: stacks-block-height
+        }
+      )
+      
+      (map-set disputes
+        { dispute-id: dispute-id }
+        (merge dispute-data {
+          community-votes-for: (+ (get community-votes-for dispute-data) 
+                                 (if support-ruling voting-power u0)),
+          community-votes-against: (+ (get community-votes-against dispute-data) 
+                                     (if support-ruling u0 voting-power))
+        })
+      )
+      
+      (ok true)
+    )
+  )
+)
+
+;; Finalize dispute after community review period
+(define-public (finalize-dispute (dispute-id uint))
+  (let
+    ((dispute-data (unwrap! (get-dispute dispute-id) (err u57))))
+    
+    (asserts! (is-eq (get status dispute-data) "community-review") (err u67))
+    (asserts! (>= (- stacks-block-height (get filed-block dispute-data)) u432) (err u70)) ;; 3 day minimum
+    
+    (let
+      ((ruling-upheld (> (get community-votes-for dispute-data) (get community-votes-against dispute-data))))
+      
+      (map-set disputes
+        { dispute-id: dispute-id }
+        (merge dispute-data {
+          status: (if ruling-upheld "resolved-upheld" "resolved-overturned")
+        })
+      )
+      
+      ;; Reward arbitrator if ruling was upheld
+      (if ruling-upheld
+        (match (get arbitrator dispute-data)
+          arbitrator-principal
+          (let
+            ((reward-amount (/ (* (get amount-disputed dispute-data) (var-get arbitrator-reward-percentage)) u100)))
+            (as-contract (stx-transfer? reward-amount tx-sender arbitrator-principal))
+          )
+          (ok true)
+        )
+        (ok true)
+      )
+    )
+  )
+)
+
+;; File appeal for dispute resolution - second chance for complex cases
+(define-public (file-appeal (dispute-id uint) (appeal-reason (string-ascii 200)))
+  (let
+    ((dispute-data (unwrap! (get-dispute dispute-id) (err u57))))
+    
+    (asserts! (or (is-eq (get status dispute-data) "resolved-upheld")
+                  (is-eq (get status dispute-data) "resolved-overturned")) (err u71))
+    (asserts! (< (get appeal-count dispute-data) u2) (err u72)) ;; Max 2 appeals
+    (asserts! (or (is-eq tx-sender (get initiator dispute-data))
+                  (is-eq tx-sender (get respondent dispute-data))) (err u64))
+    
+    ;; Higher fee for appeals
+    (try! (stx-transfer? (* (var-get dispute-fee) u2) tx-sender (as-contract tx-sender)))
+    
+    (map-set disputes
+      { dispute-id: dispute-id }
+      (merge dispute-data {
+        status: "appeal-pending",
+        appeal-count: (+ (get appeal-count dispute-data) u1),
+        arbitrator: none
+      })
+    )
+    
+    (ok true)
+  )
+)
+
+;; Admin functions for dispute system management
+(define-public (update-dispute-parameters 
+    (new-arbitration-period uint) 
+    (new-min-stake uint) 
+    (new-dispute-fee uint))
+  (begin
+    (asserts! (is-eq tx-sender (var-get admin)) (err u17))
+    (asserts! (> new-arbitration-period u144) (err u73)) ;; Minimum 1 day
+    
+    (var-set arbitration-period new-arbitration-period)
+    (var-set min-arbitrator-stake new-min-stake)
+    (var-set dispute-fee new-dispute-fee)
+    
+    (ok true)
+  )
+)
+
 
 (define-read-only (get-member-risk-profile (pid uint) (member principal))
   (map-get? member-risk-profile { pool-id: pid, member: member })
@@ -1112,3 +1500,4 @@
     (ok true)
   )
 )
+
