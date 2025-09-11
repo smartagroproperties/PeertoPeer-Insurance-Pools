@@ -1501,3 +1501,323 @@
   )
 )
 
+;; =====================================
+;; EMERGENCY FUND RESERVE SYSTEM
+;; =====================================
+
+;; Emergency Fund Constants
+(define-constant ERR_EMERGENCY_NOT_DECLARED (err u500))
+(define-constant ERR_EMERGENCY_ALREADY_ACTIVE (err u501))
+(define-constant ERR_INSUFFICIENT_RESERVE (err u502))
+(define-constant ERR_INVALID_RESERVE_PERCENTAGE (err u503))
+(define-constant ERR_EMERGENCY_CLAIM_LIMIT_EXCEEDED (err u504))
+(define-constant ERR_RESERVE_LOCKED (err u505))
+
+;; Emergency system variables
+(define-data-var emergency-reserve-percentage uint u15) ;; 15% of contributions go to emergency fund
+(define-data-var emergency-claim-multiplier uint u200) ;; 2x normal claim limit during emergencies
+(define-data-var emergency-duration-blocks uint u1440) ;; 1 day emergency period
+(define-data-var min-reserve-threshold uint u1000000) ;; Minimum reserve before emergency claims
+
+;; Emergency fund tracking
+(define-map pool-emergency-reserves
+    { pool-id: uint }
+    {
+        reserve-amount: uint,
+        target-reserve: uint,
+        reserve-percentage: uint,
+        last-contribution-block: uint,
+        emergency-active: bool,
+        emergency-start-block: uint,
+        emergency-end-block: uint,
+        emergency-claims-paid: uint,
+        total-emergency-claims: uint
+    }
+)
+
+;; Emergency events log
+(define-map emergency-events
+    { pool-id: uint, event-id: uint }
+    {
+        event-type: (string-ascii 30),
+        description: (string-ascii 200),
+        declared-by: principal,
+        declared-at: uint,
+        claims-processed: uint,
+        total-payout: uint,
+        resolved: bool
+    }
+)
+
+;; Emergency claims tracking
+(define-map emergency-claims
+    { pool-id: uint, claim-id: uint }
+    {
+        is-emergency-claim: bool,
+        auto-approved: bool,
+        emergency-event-id: uint,
+        expedited-payout: uint
+    }
+)
+
+;; Emergency event counter
+(define-map pool-emergency-counter
+    { pool-id: uint }
+    { counter: uint }
+)
+
+;; Initialize emergency reserve for a pool
+(define-public (initialize-emergency-reserve (pool-identifier uint) (reserve-percentage uint))
+    (let (
+        (pool (unwrap! (get-pool pool-identifier) (err u2)))
+        (current-reserve (map-get? pool-emergency-reserves { pool-id: pool-identifier }))
+    )
+        (asserts! (is-eq tx-sender (get creator pool)) (err u16))
+        (asserts! (get active pool) (err u3))
+        (asserts! (and (>= reserve-percentage u5) (<= reserve-percentage u30)) ERR_INVALID_RESERVE_PERCENTAGE)
+        (asserts! (is-none current-reserve) (err u41))
+        
+        ;; Calculate target reserve based on pool size
+        (let (
+            (target-reserve (/ (* (get total-funds pool) reserve-percentage) u100))
+        )
+            (map-set pool-emergency-reserves
+                { pool-id: pool-identifier }
+                {
+                    reserve-amount: u0,
+                    target-reserve: target-reserve,
+                    reserve-percentage: reserve-percentage,
+                    last-contribution-block: stacks-block-height,
+                    emergency-active: false,
+                    emergency-start-block: u0,
+                    emergency-end-block: u0,
+                    emergency-claims-paid: u0,
+                    total-emergency-claims: u0
+                }
+            )
+            
+            (map-set pool-emergency-counter
+                { pool-id: pool-identifier }
+                { counter: u0 }
+            )
+            
+            (ok true)
+        )
+    )
+)
+
+;; Contribute to emergency reserve (automatic when joining pool)
+(define-public (contribute-to-emergency-reserve (pool-identifier uint) (contribution-amount uint))
+    (let (
+        (pool (unwrap! (get-pool pool-identifier) (err u2)))
+        (reserve-data (unwrap! (map-get? pool-emergency-reserves { pool-id: pool-identifier }) ERR_EMERGENCY_NOT_DECLARED))
+        (emergency-contribution (/ (* contribution-amount (get reserve-percentage reserve-data)) u100))
+    )
+        (asserts! (get active pool) (err u3))
+        (asserts! (> contribution-amount u0) (err u4))
+        
+        ;; Transfer emergency contribution to reserves
+        (map-set pool-emergency-reserves
+            { pool-id: pool-identifier }
+            (merge reserve-data {
+                reserve-amount: (+ (get reserve-amount reserve-data) emergency-contribution),
+                last-contribution-block: stacks-block-height
+            })
+        )
+        
+        (ok emergency-contribution)
+    )
+)
+
+;; Declare emergency for rapid claim processing
+(define-public (declare-emergency (pool-identifier uint) (event-type (string-ascii 30)) (description (string-ascii 200)))
+    (let (
+        (pool (unwrap! (get-pool pool-identifier) (err u2)))
+        (reserve-data (unwrap! (map-get? pool-emergency-reserves { pool-id: pool-identifier }) ERR_EMERGENCY_NOT_DECLARED))
+        (event-counter (unwrap! (map-get? pool-emergency-counter { pool-id: pool-identifier }) (err u8)))
+        (current-block stacks-block-height)
+    )
+        (asserts! (is-eq tx-sender (get creator pool)) (err u16))
+        (asserts! (get active pool) (err u3))
+        (asserts! (not (get emergency-active reserve-data)) ERR_EMERGENCY_ALREADY_ACTIVE)
+        (asserts! (>= (get reserve-amount reserve-data) (var-get min-reserve-threshold)) ERR_INSUFFICIENT_RESERVE)
+        
+        (let (
+            (event-id (get counter event-counter))
+            (emergency-end (+ current-block (var-get emergency-duration-blocks)))
+        )
+            ;; Update reserve status
+            (map-set pool-emergency-reserves
+                { pool-id: pool-identifier }
+                (merge reserve-data {
+                    emergency-active: true,
+                    emergency-start-block: current-block,
+                    emergency-end-block: emergency-end
+                })
+            )
+            
+            ;; Log emergency event
+            (map-set emergency-events
+                { pool-id: pool-identifier, event-id: event-id }
+                {
+                    event-type: event-type,
+                    description: description,
+                    declared-by: tx-sender,
+                    declared-at: current-block,
+                    claims-processed: u0,
+                    total-payout: u0,
+                    resolved: false
+                }
+            )
+            
+            ;; Update event counter
+            (map-set pool-emergency-counter
+                { pool-id: pool-identifier }
+                { counter: (+ event-id u1) }
+            )
+            
+            (ok event-id)
+        )
+    )
+)
+
+;; Process emergency claim with expedited approval
+(define-public (process-emergency-claim (pool-identifier uint) (claim-id uint))
+    (let (
+        (pool (unwrap! (get-pool pool-identifier) (err u2)))
+        (claim-data (unwrap! (get-claim pool-identifier claim-id) (err u10)))
+        (reserve-data (unwrap! (map-get? pool-emergency-reserves { pool-id: pool-identifier }) ERR_EMERGENCY_NOT_DECLARED))
+        (current-block stacks-block-height)
+    )
+        (asserts! (get active pool) (err u3))
+        (asserts! (get emergency-active reserve-data) ERR_EMERGENCY_NOT_DECLARED)
+        (asserts! (< current-block (get emergency-end-block reserve-data)) ERR_EMERGENCY_NOT_DECLARED)
+        (asserts! (is-eq (get status claim-data) "pending") (err u11))
+        
+        ;; Check emergency claim limits
+        (let (
+            (max-emergency-amount (/ (* (get coverage-amount pool) (var-get emergency-claim-multiplier)) u100))
+            (claim-amount (get amount claim-data))
+        )
+            (asserts! (<= claim-amount max-emergency-amount) ERR_EMERGENCY_CLAIM_LIMIT_EXCEEDED)
+            (asserts! (>= (get reserve-amount reserve-data) claim-amount) ERR_INSUFFICIENT_RESERVE)
+            
+            ;; Auto-approve and pay emergency claim
+            (map-set claims
+                { pool-id: pool-identifier, claim-id: claim-id }
+                (merge claim-data {
+                    status: "emergency-approved",
+                    paid: true
+                })
+            )
+            
+            ;; Mark as emergency claim
+            (map-set emergency-claims
+                { pool-id: pool-identifier, claim-id: claim-id }
+                {
+                    is-emergency-claim: true,
+                    auto-approved: true,
+                    emergency-event-id: (- (get counter (unwrap-panic (map-get? pool-emergency-counter { pool-id: pool-identifier }))) u1),
+                    expedited-payout: claim-amount
+                }
+            )
+            
+            ;; Update reserves
+            (map-set pool-emergency-reserves
+                { pool-id: pool-identifier }
+                (merge reserve-data {
+                    reserve-amount: (- (get reserve-amount reserve-data) claim-amount),
+                    emergency-claims-paid: (+ (get emergency-claims-paid reserve-data) u1),
+                    total-emergency-claims: (+ (get total-emergency-claims reserve-data) claim-amount)
+                })
+            )
+            
+            ;; Process payout from emergency reserves
+            (unwrap! (as-contract (stx-transfer? claim-amount tx-sender (get claimant claim-data))) (err u18))
+            
+            (ok true)
+        )
+    )
+)
+
+;; End emergency period
+(define-public (resolve-emergency (pool-identifier uint))
+    (let (
+        (pool (unwrap! (get-pool pool-identifier) (err u2)))
+        (reserve-data (unwrap! (map-get? pool-emergency-reserves { pool-id: pool-identifier }) ERR_EMERGENCY_NOT_DECLARED))
+        (current-event-id (- (get counter (unwrap! (map-get? pool-emergency-counter { pool-id: pool-identifier }) (err u8))) u1))
+        (current-block stacks-block-height)
+    )
+        (asserts! (is-eq tx-sender (get creator pool)) (err u16))
+        (asserts! (get emergency-active reserve-data) ERR_EMERGENCY_NOT_DECLARED)
+        (asserts! (> current-block (get emergency-end-block reserve-data)) (err u37))
+        
+        ;; End emergency period
+        (map-set pool-emergency-reserves
+            { pool-id: pool-identifier }
+            (merge reserve-data {
+                emergency-active: false,
+                emergency-start-block: u0,
+                emergency-end-block: u0
+            })
+        )
+        
+        ;; Mark event as resolved
+        (map-set emergency-events
+            { pool-id: pool-identifier, event-id: current-event-id }
+            (merge (unwrap-panic (map-get? emergency-events { pool-id: pool-identifier, event-id: current-event-id })) {
+                resolved: true
+            })
+        )
+        
+        (ok true)
+    )
+)
+
+;; Read-only functions for emergency system
+(define-read-only (get-emergency-reserve (pool-identifier uint))
+    (map-get? pool-emergency-reserves { pool-id: pool-identifier })
+)
+
+(define-read-only (get-emergency-event (pool-identifier uint) (event-id uint))
+    (map-get? emergency-events { pool-id: pool-identifier, event-id: event-id })
+)
+
+(define-read-only (get-emergency-claim-info (pool-identifier uint) (claim-id uint))
+    (map-get? emergency-claims { pool-id: pool-identifier, claim-id: claim-id })
+)
+
+(define-read-only (is-emergency-active (pool-identifier uint))
+    (match (map-get? pool-emergency-reserves { pool-id: pool-identifier })
+        reserve-data
+        (and 
+            (get emergency-active reserve-data)
+            (< stacks-block-height (get emergency-end-block reserve-data))
+        )
+        false
+    )
+)
+
+(define-read-only (calculate-emergency-fund-health (pool-identifier uint))
+    (match (map-get? pool-emergency-reserves { pool-id: pool-identifier })
+        reserve-data
+        (let (
+            (current-reserve (get reserve-amount reserve-data))
+            (target-reserve (get target-reserve reserve-data))
+            (health-percentage (if (> target-reserve u0)
+                                 (/ (* current-reserve u100) target-reserve)
+                                 u0))
+        )
+            (some {
+                health-percentage: health-percentage,
+                reserve-status: (if (>= health-percentage u100) "healthy"
+                               (if (>= health-percentage u75) "adequate"
+                               (if (>= health-percentage u50) "low" "critical"))),
+                current-amount: current-reserve,
+                target-amount: target-reserve
+            })
+        )
+        none
+    )
+)
+
